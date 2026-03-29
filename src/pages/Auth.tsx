@@ -1,21 +1,54 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
-import { Zap, Mail, Lock, Eye, EyeOff } from "lucide-react";
+import { Zap, Mail, Lock, Eye, EyeOff, Building2, User as UserIcon } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router-dom";
+import { useAuth } from "@/hooks/useAuth";
+import { useToast } from "@/hooks/use-toast";
 
 export default function Auth() {
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [showPassword, setShowPassword] = useState(false);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [companyName, setCompanyName] = useState("");
+  const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
+  const { signIn, signUp, session } = useAuth();
+  const { toast } = useToast();
 
-  const handleSubmit = (e: React.FormEvent) => {
+  if (session) {
+    navigate("/", { replace: true });
+    return null;
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // TODO: Wire to Supabase auth
-    navigate("/");
+    setLoading(true);
+    try {
+      if (mode === "login") {
+        await signIn(email, password);
+        navigate("/");
+      } else {
+        await signUp(email, password, fullName, companyName);
+        toast({
+          title: "Account created!",
+          description: "Check your email to verify your account, or sign in directly.",
+        });
+      }
+    } catch (err: any) {
+      toast({
+        title: "Error",
+        description: err.message || "Authentication failed",
+        variant: "destructive",
+      });
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -25,7 +58,6 @@ export default function Auth() {
         animate={{ opacity: 1, y: 0 }}
         className="w-full max-w-md"
       >
-        {/* Logo */}
         <div className="mb-8 text-center">
           <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-primary">
             <Zap className="h-6 w-6 text-primary-foreground" />
@@ -59,20 +91,26 @@ export default function Auth() {
               {mode === "signup" && (
                 <div className="space-y-2">
                   <Label>Company Name</Label>
-                  <Input placeholder="Acme Corp" className="bg-secondary/50" />
+                  <div className="relative">
+                    <Building2 className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <Input placeholder="Acme Corp" value={companyName} onChange={(e) => setCompanyName(e.target.value)} className="bg-secondary/50 pl-9" required />
+                  </div>
                 </div>
               )}
               {mode === "signup" && (
                 <div className="space-y-2">
                   <Label>Full Name</Label>
-                  <Input placeholder="John Doe" className="bg-secondary/50" />
+                  <div className="relative">
+                    <UserIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <Input placeholder="John Doe" value={fullName} onChange={(e) => setFullName(e.target.value)} className="bg-secondary/50 pl-9" required />
+                  </div>
                 </div>
               )}
               <div className="space-y-2">
                 <Label>Email</Label>
                 <div className="relative">
                   <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                  <Input placeholder="you@company.com" className="bg-secondary/50 pl-9" />
+                  <Input type="email" placeholder="you@company.com" value={email} onChange={(e) => setEmail(e.target.value)} className="bg-secondary/50 pl-9" required />
                 </div>
               </div>
               <div className="space-y-2">
@@ -82,7 +120,11 @@ export default function Auth() {
                   <Input
                     type={showPassword ? "text" : "password"}
                     placeholder="••••••••"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
                     className="bg-secondary/50 pl-9 pr-9"
+                    required
+                    minLength={6}
                   />
                   <button
                     type="button"
@@ -93,16 +135,10 @@ export default function Auth() {
                   </button>
                 </div>
               </div>
-              <Button type="submit" className="w-full">
-                {mode === "login" ? "Sign In" : "Create Account"}
+              <Button type="submit" className="w-full" disabled={loading}>
+                {loading ? "Please wait..." : mode === "login" ? "Sign In" : "Create Account"}
               </Button>
             </form>
-
-            {mode === "login" && (
-              <p className="mt-4 text-center text-xs text-muted-foreground">
-                <button className="text-primary hover:underline">Forgot password?</button>
-              </p>
-            )}
           </CardContent>
         </Card>
       </motion.div>

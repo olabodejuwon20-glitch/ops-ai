@@ -2,18 +2,18 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import {
   Search,
-  Filter,
   Plus,
   MoreHorizontal,
   Phone,
   Mail,
   MessageSquare,
   User,
+  Sparkles,
+  Loader2,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Select,
   SelectContent,
@@ -30,30 +30,14 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { useAuth } from "@/hooks/useAuth";
+import { supabase } from "@/integrations/supabase/client";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useToast } from "@/hooks/use-toast";
+import { analyzeLeadMessage } from "@/lib/ai-agent";
+import type { Tables } from "@/integrations/supabase/types";
 
-interface Lead {
-  id: string;
-  name: string;
-  email: string;
-  phone: string;
-  company: string;
-  status: "new" | "contacted" | "qualified" | "closed";
-  tag: "hot" | "warm" | "cold";
-  source: "website" | "whatsapp" | "email" | "api";
-  assignee: string;
-  lastActivity: string;
-  message: string;
-}
-
-const mockLeads: Lead[] = [
-  { id: "1", name: "Sarah Chen", email: "sarah@acme.co", phone: "+1 555-0101", company: "Acme Corp", status: "new", tag: "hot", source: "website", assignee: "AI Agent", lastActivity: "2 min ago", message: "Interested in enterprise plan" },
-  { id: "2", name: "Marcus Williams", email: "marcus@startup.io", phone: "+1 555-0102", company: "StartupIO", status: "contacted", tag: "warm", source: "whatsapp", assignee: "John D.", lastActivity: "15 min ago", message: "Pricing inquiry for team of 50" },
-  { id: "3", name: "Elena Rodriguez", email: "elena@corp.com", phone: "+1 555-0103", company: "GlobalCorp", status: "qualified", tag: "hot", source: "email", assignee: "AI Agent", lastActivity: "1h ago", message: "Ready to schedule a demo" },
-  { id: "4", name: "James Park", email: "james@tech.dev", phone: "+1 555-0104", company: "TechDev", status: "new", tag: "cold", source: "website", assignee: "Unassigned", lastActivity: "2h ago", message: "Just browsing" },
-  { id: "5", name: "Aisha Patel", email: "aisha@growth.co", phone: "+1 555-0105", company: "GrowthCo", status: "contacted", tag: "warm", source: "api", assignee: "Sarah M.", lastActivity: "3h ago", message: "Looking for integration support" },
-  { id: "6", name: "David Kim", email: "david@megacorp.com", phone: "+1 555-0106", company: "MegaCorp", status: "qualified", tag: "hot", source: "email", assignee: "AI Agent", lastActivity: "4h ago", message: "Budget approved, need proposal" },
-  { id: "7", name: "Lisa Thompson", email: "lisa@newbiz.co", phone: "+1 555-0107", company: "NewBiz", status: "closed", tag: "hot", source: "website", assignee: "John D.", lastActivity: "1d ago", message: "Signed annual contract" },
-];
+type Lead = Tables<"leads">;
 
 const tagStyles: Record<string, string> = {
   hot: "bg-destructive/15 text-destructive border-destructive/20",
@@ -79,25 +63,116 @@ export default function Leads() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [tagFilter, setTagFilter] = useState("all");
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [newLead, setNewLead] = useState({ name: "", email: "", phone: "", company: "", message: "" });
+  const [analyzing, setAnalyzing] = useState(false);
+  const { companyId } = useAuth();
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
 
-  const filtered = mockLeads.filter((lead) => {
+  const { data: leads = [], isLoading } = useQuery({
+    queryKey: ["leads", companyId],
+    queryFn: async () => {
+      if (!companyId) return [];
+      const { data, error } = await supabase
+        .from("leads")
+        .select("*")
+        .eq("company_id", companyId)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return data as Lead[];
+    },
+    enabled: !!companyId,
+  });
+
+  const createLeadMutation = useMutation({
+    mutationFn: async () => {
+      if (!companyId) throw new Error("No company");
+
+      // First create the lead
+      const { data: lead, error } = await supabase
+        .from("leads")
+        .insert({
+          company_id: companyId,
+          name: newLead.name,
+          email: newLead.email || null,
+          phone: newLead.phone || null,
+          lead_company: newLead.company || null,
+          message: newLead.message || null,
+          source: "website" as const,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+
+      // Then analyze with AI if there's a message
+      if (newLead.message && lead) {
+        setAnalyzing(true);
+        try {
+          const { analysis } = await analyzeLeadMessage(newLead.message, {
+            name: newLead.name,
+            company: newLead.company,
+            source: "website",
+          });
+
+          if (analysis) {
+            await supabase
+              .from("leads")
+              .update({
+                tag: analysis.suggestedTag,
+                status: analysis.suggestedStatus,
+                intent: analysis.intent,
+                ai_summary: analysis.summary,
+              })
+              .eq("id", lead.id);
+          }
+        } catch (e) {
+          console.error("AI analysis failed:", e);
+        } finally {
+          setAnalyzing(false);
+        }
+      }
+
+      return lead;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["leads"] });
+      setNewLead({ name: "", email: "", phone: "", company: "", message: "" });
+      setDialogOpen(false);
+      toast({ title: "Lead created", description: "AI has analyzed and tagged the lead." });
+    },
+    onError: (err: any) => {
+      toast({ title: "Error", description: err.message, variant: "destructive" });
+    },
+  });
+
+  const filtered = leads.filter((lead) => {
     const matchesSearch =
       lead.name.toLowerCase().includes(search.toLowerCase()) ||
-      lead.email.toLowerCase().includes(search.toLowerCase()) ||
-      lead.company.toLowerCase().includes(search.toLowerCase());
+      (lead.email || "").toLowerCase().includes(search.toLowerCase()) ||
+      (lead.lead_company || "").toLowerCase().includes(search.toLowerCase());
     const matchesStatus = statusFilter === "all" || lead.status === statusFilter;
     const matchesTag = tagFilter === "all" || lead.tag === tagFilter;
     return matchesSearch && matchesStatus && matchesTag;
   });
+
+  const timeAgo = (dateStr: string) => {
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+  };
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Leads</h1>
-          <p className="text-sm text-muted-foreground">{mockLeads.length} total leads</p>
+          <p className="text-sm text-muted-foreground">{leads.length} total leads</p>
         </div>
-        <Dialog>
+        <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogTrigger asChild>
             <Button className="gap-2">
               <Plus className="h-4 w-4" />
@@ -111,29 +186,39 @@ export default function Leads() {
             <div className="space-y-4 pt-2">
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label>Name</Label>
-                  <Input placeholder="Full name" className="bg-secondary/50" />
+                  <Label>Name *</Label>
+                  <Input placeholder="Full name" className="bg-secondary/50" value={newLead.name} onChange={(e) => setNewLead({ ...newLead, name: e.target.value })} required />
                 </div>
                 <div className="space-y-2">
                   <Label>Email</Label>
-                  <Input placeholder="email@company.com" className="bg-secondary/50" />
+                  <Input placeholder="email@company.com" className="bg-secondary/50" value={newLead.email} onChange={(e) => setNewLead({ ...newLead, email: e.target.value })} />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label>Phone</Label>
-                  <Input placeholder="+1 555-0000" className="bg-secondary/50" />
+                  <Input placeholder="+1 555-0000" className="bg-secondary/50" value={newLead.phone} onChange={(e) => setNewLead({ ...newLead, phone: e.target.value })} />
                 </div>
                 <div className="space-y-2">
                   <Label>Company</Label>
-                  <Input placeholder="Company name" className="bg-secondary/50" />
+                  <Input placeholder="Company name" className="bg-secondary/50" value={newLead.company} onChange={(e) => setNewLead({ ...newLead, company: e.target.value })} />
                 </div>
               </div>
               <div className="space-y-2">
                 <Label>Message</Label>
-                <Textarea placeholder="Initial message or notes..." className="bg-secondary/50" />
+                <Textarea placeholder="Initial message or notes..." className="bg-secondary/50" value={newLead.message} onChange={(e) => setNewLead({ ...newLead, message: e.target.value })} />
               </div>
-              <Button className="w-full">Create Lead</Button>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Sparkles className="h-3 w-3 text-primary" />
+                AI will automatically analyze and tag this lead
+              </div>
+              <Button className="w-full" onClick={() => createLeadMutation.mutate()} disabled={!newLead.name || createLeadMutation.isPending}>
+                {createLeadMutation.isPending ? (
+                  <>{analyzing ? "AI Analyzing..." : "Creating..."} <Loader2 className="ml-2 h-4 w-4 animate-spin" /></>
+                ) : (
+                  "Create Lead"
+                )}
+              </Button>
             </div>
           </DialogContent>
         </Dialog>
@@ -143,17 +228,10 @@ export default function Leads() {
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative flex-1 min-w-[200px] max-w-sm">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-          <Input
-            placeholder="Search leads..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="pl-9 bg-secondary/50 border-0"
-          />
+          <Input placeholder="Search leads..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9 bg-secondary/50 border-0" />
         </div>
         <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger className="w-[140px] bg-secondary/50 border-0">
-            <SelectValue placeholder="Status" />
-          </SelectTrigger>
+          <SelectTrigger className="w-[140px] bg-secondary/50 border-0"><SelectValue placeholder="Status" /></SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All Status</SelectItem>
             <SelectItem value="new">New</SelectItem>
@@ -163,9 +241,7 @@ export default function Leads() {
           </SelectContent>
         </Select>
         <Select value={tagFilter} onValueChange={setTagFilter}>
-          <SelectTrigger className="w-[120px] bg-secondary/50 border-0">
-            <SelectValue placeholder="Tag" />
-          </SelectTrigger>
+          <SelectTrigger className="w-[120px] bg-secondary/50 border-0"><SelectValue placeholder="Tag" /></SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All Tags</SelectItem>
             <SelectItem value="hot">Hot</SelectItem>
@@ -178,64 +254,80 @@ export default function Leads() {
       {/* Lead Table */}
       <Card className="border-border bg-card overflow-hidden">
         <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-border">
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Lead</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Status</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Tag</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Source</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Assigned</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Activity</th>
-                  <th className="px-4 py-3 text-right text-xs font-medium text-muted-foreground uppercase tracking-wider"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((lead) => {
-                  const SourceIcon = sourceIcons[lead.source] || User;
-                  return (
-                    <tr key={lead.id} className="border-b border-border/50 hover:bg-secondary/20 transition-colors">
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-3">
-                          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-secondary text-xs font-semibold">
-                            {lead.name.split(" ").map(n => n[0]).join("")}
+          {isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : filtered.length === 0 ? (
+            <div className="py-12 text-center text-sm text-muted-foreground">
+              {leads.length === 0 ? "No leads yet. Add your first lead!" : "No leads match your filters."}
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-border">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Lead</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Status</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Tag</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Source</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Intent</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Activity</th>
+                    <th className="px-4 py-3"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((lead) => {
+                    const SourceIcon = sourceIcons[lead.source] || User;
+                    return (
+                      <tr key={lead.id} className="border-b border-border/50 hover:bg-secondary/20 transition-colors">
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-3">
+                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-secondary text-xs font-semibold">
+                              {lead.name.split(" ").map(n => n[0]).join("").slice(0, 2)}
+                            </div>
+                            <div>
+                              <p className="text-sm font-medium">{lead.name}</p>
+                              <p className="text-xs text-muted-foreground">{lead.lead_company || lead.email || "—"}</p>
+                            </div>
                           </div>
-                          <div>
-                            <p className="text-sm font-medium">{lead.name}</p>
-                            <p className="text-xs text-muted-foreground">{lead.company}</p>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${statusStyles[lead.status]}`}>
+                            {lead.status}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${tagStyles[lead.tag]}`}>
+                            {lead.tag}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                            <SourceIcon className="h-3 w-3" />
+                            {lead.source}
                           </div>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${statusStyles[lead.status]}`}>
-                          {lead.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${tagStyles[lead.tag]}`}>
-                          {lead.tag}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                          <SourceIcon className="h-3 w-3" />
-                          {lead.source}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-sm text-muted-foreground">{lead.assignee}</td>
-                      <td className="px-4 py-3 text-xs text-muted-foreground">{lead.lastActivity}</td>
-                      <td className="px-4 py-3 text-right">
-                        <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground">
-                          <MoreHorizontal className="h-4 w-4" />
-                        </Button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          {lead.intent ? (
+                            <span className="text-xs text-muted-foreground capitalize">{lead.intent}</span>
+                          ) : (
+                            <span className="text-xs text-muted-foreground/50">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{timeAgo(lead.updated_at)}</td>
+                        <td className="px-4 py-3 text-right">
+                          <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground">
+                            <MoreHorizontal className="h-4 w-4" />
+                          </Button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </CardContent>
       </Card>
     </motion.div>
