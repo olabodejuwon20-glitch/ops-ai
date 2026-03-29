@@ -1,164 +1,276 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
-import { Send, Bot, User, Phone, Mail, MessageSquare } from "lucide-react";
+import { Send, Bot, User, Phone, Mail, MessageSquare, Loader2, Sparkles } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useAuth } from "@/hooks/useAuth";
+import { supabase } from "@/integrations/supabase/client";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { streamAgentResponse } from "@/lib/ai-agent";
+import { useToast } from "@/hooks/use-toast";
+import ReactMarkdown from "react-markdown";
 
-interface Message {
-  id: string;
-  sender: "user" | "ai" | "lead";
+interface ChatMsg {
+  role: "user" | "assistant";
   content: string;
-  timestamp: string;
-  channel: "email" | "whatsapp" | "sms";
 }
 
-const conversations = [
-  { id: "1", name: "Sarah Chen", company: "Acme Corp", lastMsg: "That sounds great, let's schedule...", time: "2m", unread: 2, channel: "email" as const },
-  { id: "2", name: "Marcus Williams", company: "StartupIO", lastMsg: "What's included in the enterprise plan?", time: "15m", unread: 0, channel: "whatsapp" as const },
-  { id: "3", name: "Elena Rodriguez", company: "GlobalCorp", lastMsg: "Can you send me the proposal?", time: "1h", unread: 1, channel: "email" as const },
-  { id: "4", name: "David Kim", company: "MegaCorp", lastMsg: "Budget approved. Next steps?", time: "2h", unread: 0, channel: "sms" as const },
-];
-
-const mockMessages: Message[] = [
-  { id: "1", sender: "lead", content: "Hi, I'm interested in your enterprise plan. Can you tell me more about pricing for a team of 200+?", timestamp: "10:23 AM", channel: "email" },
-  { id: "2", sender: "ai", content: "Hi Sarah! Thanks for reaching out. For teams of 200+, we offer our Enterprise plan starting at $29/user/month with volume discounts. This includes priority support, custom integrations, and a dedicated success manager. Would you like me to schedule a demo with our team?", timestamp: "10:24 AM", channel: "email" },
-  { id: "3", sender: "lead", content: "That sounds great, let's schedule a demo. Do you have availability this week?", timestamp: "10:30 AM", channel: "email" },
-  { id: "4", sender: "ai", content: "I'd be happy to set that up! I have availability on Thursday at 2 PM or Friday at 10 AM EST. Which works better for you? I'll send a calendar invite with a Zoom link.", timestamp: "10:31 AM", channel: "email" },
-];
-
-const channelIcons = {
-  email: Mail,
-  whatsapp: MessageSquare,
-  sms: Phone,
-};
-
 export default function Messages() {
-  const [selected, setSelected] = useState("1");
+  const { companyId } = useAuth();
+  const { toast } = useToast();
+  const [selectedLeadId, setSelectedLeadId] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
+  const [isStreaming, setIsStreaming] = useState(false);
+
+  // Fetch leads with conversations
+  const { data: leads = [] } = useQuery({
+    queryKey: ["leads-for-messages", companyId],
+    queryFn: async () => {
+      if (!companyId) return [];
+      const { data, error } = await supabase
+        .from("leads")
+        .select("*")
+        .eq("company_id", companyId)
+        .order("updated_at", { ascending: false });
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!companyId,
+  });
+
+  // Fetch messages for selected lead
+  const { data: dbMessages = [] } = useQuery({
+    queryKey: ["messages", selectedLeadId],
+    queryFn: async () => {
+      if (!selectedLeadId || !companyId) return [];
+      const { data: convs } = await supabase
+        .from("conversations")
+        .select("id")
+        .eq("lead_id", selectedLeadId)
+        .eq("company_id", companyId);
+      if (!convs?.length) return [];
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .in("conversation_id", convs.map(c => c.id))
+        .order("created_at", { ascending: true });
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!selectedLeadId && !!companyId,
+  });
+
+  const selectedLead = leads.find(l => l.id === selectedLeadId);
+
+  const handleSend = async () => {
+    if (!input.trim() || isStreaming) return;
+    const userMsg: ChatMsg = { role: "user", content: input };
+    const newMessages = [...chatMessages, userMsg];
+    setChatMessages(newMessages);
+    setInput("");
+    setIsStreaming(true);
+
+    let assistantSoFar = "";
+    const upsertAssistant = (chunk: string) => {
+      assistantSoFar += chunk;
+      setChatMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant") {
+          return prev.map((m, i) => i === prev.length - 1 ? { ...m, content: assistantSoFar } : m);
+        }
+        return [...prev, { role: "assistant", content: assistantSoFar }];
+      });
+    };
+
+    try {
+      await streamAgentResponse({
+        messages: newMessages,
+        agentType: "sales",
+        tone: "professional",
+        leadContext: selectedLead ? {
+          name: selectedLead.name,
+          company: selectedLead.lead_company || "",
+          source: selectedLead.source,
+          history: selectedLead.ai_summary || undefined,
+        } : undefined,
+        onDelta: upsertAssistant,
+        onDone: () => setIsStreaming(false),
+      });
+
+      // Save messages to DB if we have a conversation
+      if (selectedLeadId && companyId) {
+        let convId: string;
+        const { data: existingConv } = await supabase
+          .from("conversations")
+          .select("id")
+          .eq("lead_id", selectedLeadId)
+          .eq("company_id", companyId)
+          .limit(1)
+          .single();
+
+        if (existingConv) {
+          convId = existingConv.id;
+        } else {
+          const { data: newConv } = await supabase
+            .from("conversations")
+            .insert({ lead_id: selectedLeadId, company_id: companyId, channel: "email" })
+            .select()
+            .single();
+          convId = newConv!.id;
+        }
+
+        await supabase.from("messages").insert([
+          { conversation_id: convId, company_id: companyId, sender_type: "user", content: input },
+          { conversation_id: convId, company_id: companyId, sender_type: "ai", content: assistantSoFar },
+        ]);
+      }
+    } catch (e: any) {
+      toast({ title: "AI Error", description: e.message, variant: "destructive" });
+      setIsStreaming(false);
+    }
+  };
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Messages</h1>
-        <p className="text-sm text-muted-foreground">Manage all conversations across channels.</p>
+        <p className="text-sm text-muted-foreground">AI-powered conversations with your leads.</p>
       </div>
 
       <div className="grid grid-cols-12 gap-4 h-[calc(100vh-220px)]">
-        {/* Conversation List */}
+        {/* Lead List */}
         <div className="col-span-4">
           <Card className="border-border bg-card h-full flex flex-col">
             <CardHeader className="pb-3">
-              <Input placeholder="Search conversations..." className="bg-secondary/50 border-0 text-sm" />
+              <Input placeholder="Search leads..." className="bg-secondary/50 border-0 text-sm" />
             </CardHeader>
             <CardContent className="flex-1 overflow-y-auto space-y-1 px-3">
-              {conversations.map((conv) => {
-                const Icon = channelIcons[conv.channel];
-                return (
-                  <button
-                    key={conv.id}
-                    onClick={() => setSelected(conv.id)}
-                    className={`w-full flex items-start gap-3 rounded-lg px-3 py-3 text-left transition-colors ${
-                      selected === conv.id ? "bg-secondary" : "hover:bg-secondary/40"
-                    }`}
-                  >
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
-                      {conv.name.split(" ").map(n => n[0]).join("")}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between">
-                        <p className="text-sm font-medium truncate">{conv.name}</p>
-                        <span className="text-[10px] text-muted-foreground">{conv.time}</span>
-                      </div>
-                      <p className="text-xs text-muted-foreground truncate">{conv.lastMsg}</p>
-                    </div>
-                    <div className="flex flex-col items-end gap-1">
-                      <Icon className="h-3 w-3 text-muted-foreground" />
-                      {conv.unread > 0 && (
-                        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">
-                          {conv.unread}
-                        </span>
-                      )}
-                    </div>
-                  </button>
-                );
-              })}
+              {leads.length === 0 ? (
+                <p className="text-sm text-muted-foreground text-center py-8">No leads yet</p>
+              ) : leads.map((lead) => (
+                <button
+                  key={lead.id}
+                  onClick={() => {
+                    setSelectedLeadId(lead.id);
+                    setChatMessages([]);
+                  }}
+                  className={`w-full flex items-start gap-3 rounded-lg px-3 py-3 text-left transition-colors ${
+                    selectedLeadId === lead.id ? "bg-secondary" : "hover:bg-secondary/40"
+                  }`}
+                >
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
+                    {lead.name.split(" ").map(n => n[0]).join("").slice(0, 2)}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{lead.name}</p>
+                    <p className="text-xs text-muted-foreground truncate">{lead.lead_company || lead.email || "—"}</p>
+                  </div>
+                  {lead.tag && (
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                      lead.tag === "hot" ? "bg-destructive/15 text-destructive" :
+                      lead.tag === "warm" ? "bg-warning/15 text-warning" : "bg-info/15 text-info"
+                    }`}>{lead.tag}</span>
+                  )}
+                </button>
+              ))}
             </CardContent>
           </Card>
         </div>
 
-        {/* Chat Panel */}
+        {/* Chat */}
         <div className="col-span-8">
           <Card className="border-border bg-card h-full flex flex-col">
-            <CardHeader className="pb-3 border-b border-border">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
-                    SC
+            {selectedLead ? (
+              <>
+                <CardHeader className="pb-3 border-b border-border">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
+                      {selectedLead.name.split(" ").map(n => n[0]).join("").slice(0, 2)}
+                    </div>
+                    <div>
+                      <CardTitle className="text-sm">{selectedLead.name}</CardTitle>
+                      <p className="text-xs text-muted-foreground">{selectedLead.lead_company || "—"} · {selectedLead.source}</p>
+                    </div>
+                    <div className="ml-auto flex items-center gap-1 text-xs text-primary">
+                      <Sparkles className="h-3 w-3" />
+                      AI Sales Agent
+                    </div>
                   </div>
-                  <div>
-                    <CardTitle className="text-sm">Sarah Chen</CardTitle>
-                    <p className="text-xs text-muted-foreground">Acme Corp · via Email</p>
-                  </div>
+                </CardHeader>
+                <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
+                  {/* Show stored messages */}
+                  {dbMessages.map((msg) => (
+                    <div key={msg.id} className={`flex gap-3 ${msg.sender_type === "lead" ? "" : "flex-row-reverse"}`}>
+                      <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${
+                        msg.sender_type === "ai" ? "bg-primary/20" : "bg-secondary"
+                      }`}>
+                        {msg.sender_type === "ai" ? <Bot className="h-3.5 w-3.5 text-primary" /> : <User className="h-3.5 w-3.5 text-muted-foreground" />}
+                      </div>
+                      <div className={`max-w-[70%] rounded-xl px-4 py-2.5 ${
+                        msg.sender_type === "ai" ? "bg-primary/10" : "bg-secondary"
+                      }`}>
+                        <div className="text-sm prose prose-sm prose-invert max-w-none">
+                          <ReactMarkdown>{msg.content}</ReactMarkdown>
+                        </div>
+                        <p className="mt-1 text-[10px] text-muted-foreground">
+                          {new Date(msg.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                  {/* Show live chat messages */}
+                  {chatMessages.map((msg, i) => (
+                    <div key={`chat-${i}`} className={`flex gap-3 ${msg.role === "user" ? "flex-row-reverse" : ""}`}>
+                      <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${
+                        msg.role === "assistant" ? "bg-primary/20" : "bg-secondary"
+                      }`}>
+                        {msg.role === "assistant" ? <Bot className="h-3.5 w-3.5 text-primary" /> : <User className="h-3.5 w-3.5 text-muted-foreground" />}
+                      </div>
+                      <div className={`max-w-[70%] rounded-xl px-4 py-2.5 ${
+                        msg.role === "assistant" ? "bg-primary/10" : "bg-secondary"
+                      }`}>
+                        <div className="text-sm prose prose-sm prose-invert max-w-none">
+                          <ReactMarkdown>{msg.content}</ReactMarkdown>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {isStreaming && chatMessages[chatMessages.length - 1]?.role !== "assistant" && (
+                    <div className="flex gap-3">
+                      <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary/20">
+                        <Loader2 className="h-3.5 w-3.5 text-primary animate-spin" />
+                      </div>
+                      <div className="rounded-xl bg-primary/10 px-4 py-2.5 text-sm text-muted-foreground">
+                        Thinking...
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+                <div className="border-t border-border p-4">
+                  <form onSubmit={(e) => { e.preventDefault(); handleSend(); }} className="flex gap-2">
+                    <Input
+                      placeholder="Type a message to the AI agent..."
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      className="bg-secondary/50 border-0"
+                      disabled={isStreaming}
+                    />
+                    <Button size="icon" type="submit" disabled={isStreaming || !input.trim()}>
+                      <Send className="h-4 w-4" />
+                    </Button>
+                  </form>
                 </div>
-                <div className="flex gap-1">
-                  <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground">
-                    <Phone className="h-4 w-4" />
-                  </Button>
-                  <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground">
-                    <Mail className="h-4 w-4" />
-                  </Button>
+              </>
+            ) : (
+              <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                <div className="text-center">
+                  <MessageSquare className="h-12 w-12 mx-auto mb-3 opacity-30" />
+                  <p className="text-sm">Select a lead to start a conversation</p>
                 </div>
               </div>
-            </CardHeader>
-            <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
-              {mockMessages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`flex gap-3 ${msg.sender === "lead" ? "" : "flex-row-reverse"}`}
-                >
-                  <div
-                    className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${
-                      msg.sender === "ai"
-                        ? "bg-primary/20"
-                        : msg.sender === "lead"
-                        ? "bg-secondary"
-                        : "bg-success/20"
-                    }`}
-                  >
-                    {msg.sender === "ai" ? (
-                      <Bot className="h-3.5 w-3.5 text-primary" />
-                    ) : (
-                      <User className="h-3.5 w-3.5 text-muted-foreground" />
-                    )}
-                  </div>
-                  <div
-                    className={`max-w-[70%] rounded-xl px-4 py-2.5 ${
-                      msg.sender === "ai"
-                        ? "bg-primary/10 text-foreground"
-                        : "bg-secondary text-foreground"
-                    }`}
-                  >
-                    <p className="text-sm">{msg.content}</p>
-                    <p className="mt-1 text-[10px] text-muted-foreground">{msg.timestamp}</p>
-                  </div>
-                </div>
-              ))}
-            </CardContent>
-            <div className="border-t border-border p-4">
-              <div className="flex gap-2">
-                <Input
-                  placeholder="Type a message..."
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  className="bg-secondary/50 border-0"
-                />
-                <Button size="icon" className="shrink-0">
-                  <Send className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
+            )}
           </Card>
         </div>
       </div>
