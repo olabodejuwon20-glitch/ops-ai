@@ -182,6 +182,7 @@ export default function Leads() {
           <DialogContent className="bg-card border-border">
             <DialogHeader>
               <DialogTitle>Add New Lead</DialogTitle>
+              <p className="text-sm text-muted-foreground">Fill in the details below. AI will analyze and tag the lead automatically.</p>
             </DialogHeader>
             <div className="space-y-4 pt-2">
               <div className="grid grid-cols-2 gap-4">

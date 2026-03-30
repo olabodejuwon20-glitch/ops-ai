@@ -1,17 +1,8 @@
 import { useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
-  LayoutDashboard,
-  Users,
-  Bot,
-  BarChart3,
-  Settings,
-  Bell,
-  MessageSquare,
-  Zap,
-  ChevronLeft,
-  ChevronRight,
-  LogOut,
+  LayoutDashboard, Users, Bot, BarChart3, Settings, Bell, MessageSquare, Zap,
+  ChevronLeft, ChevronRight, LogOut,
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -26,14 +17,18 @@ const navItems = [
   { icon: Settings, label: "Settings", path: "/settings" },
 ];
 
-export function AppSidebar() {
+interface Props {
+  onNavigate?: () => void;
+}
+
+export function AppSidebar({ onNavigate }: Props) {
   const [collapsed, setCollapsed] = useState(false);
   const location = useLocation();
   const { signOut, profile } = useAuth();
 
   return (
     <aside
-      className={`fixed left-0 top-0 z-40 flex h-screen flex-col border-r border-sidebar-border bg-sidebar transition-all duration-300 ${
+      className={`flex h-screen flex-col border-r border-sidebar-border bg-sidebar transition-all duration-300 ${
         collapsed ? "w-16" : "w-60"
       }`}
     >
@@ -57,6 +52,7 @@ export function AppSidebar() {
             <Link
               key={item.path}
               to={item.path}
+              onClick={onNavigate}
               className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
                 isActive
                   ? "bg-sidebar-accent text-sidebar-accent-foreground"
@@ -87,7 +83,7 @@ export function AppSidebar() {
         </button>
         <button
           onClick={() => setCollapsed(!collapsed)}
-          className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground transition-colors"
+          className="hidden lg:flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground transition-colors"
         >
           {collapsed ? <ChevronRight className="h-4 w-4 shrink-0" /> : (
             <><ChevronLeft className="h-4 w-4 shrink-0" /><span>Collapse</span></>
