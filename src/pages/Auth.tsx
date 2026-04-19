@@ -97,6 +97,44 @@ export default function Auth() {
               </button>
             </div>
 
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full mb-4"
+              onClick={async () => {
+                setLoading(true);
+                try {
+                  const result = await lovable.auth.signInWithOAuth("google", {
+                    redirect_uri: window.location.origin,
+                  });
+                  if (result.redirected) return;
+                  if (result.error) throw result.error;
+                  navigate("/");
+                } catch (err: any) {
+                  toast({
+                    title: "Google sign-in failed",
+                    description: err?.message || "Please try again",
+                    variant: "destructive",
+                  });
+                } finally {
+                  setLoading(false);
+                }
+              }}
+              disabled={loading}
+            >
+              <GoogleIcon />
+              Continue with Google
+            </Button>
+
+            <div className="relative mb-4">
+              <div className="absolute inset-0 flex items-center">
+                <span className="w-full border-t border-border" />
+              </div>
+              <div className="relative flex justify-center text-xs uppercase">
+                <span className="bg-card px-2 text-muted-foreground">Or continue with email</span>
+              </div>
+            </div>
+
             <form onSubmit={handleSubmit} className="space-y-4">
               {mode === "signup" && (
                 <div className="space-y-2">
